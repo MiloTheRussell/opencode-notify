@@ -1,12 +1,17 @@
 /**
  * opencode-notify
  *
- * Watches the OpenCode server's public event stream and pushes notifications to
- * an ntfy topic when:
+ * Watches the OpenCode server's public event stream and pushes notifications
+ * over ntfy and/or a Telegram bot when:
  *   - a run finishes                     (session.execution.succeeded)
  *   - a run fails                        (session.execution.failed)
  *   - an agent asks you a question        (form.created -> the `question` tool)
  *   - a tool needs approval              (permission.asked)
+ *
+ * The channel is picked from configuration: whatever you configure is used.
+ * Configure an ntfy topic, a Telegram bot token + chat id, or both. Set
+ * `channel` ("ntfy" | "telegram" | "both" | "auto") to filter explicitly;
+ * "auto" (the default) sends over every channel that has credentials.
  *
  * Note: on the public event stream a completed run surfaces as
  * session.execution.succeeded, not session.idle (that is internal/TUI-only).
@@ -15,20 +20,43 @@
  * The event stream is server-wide and spans every location, so a single
  * instance covers all concurrent sessions. A refcounted global guard keeps
  * multiple loaded locations from starting duplicate subscriptions.
+ *
+ * No dependencies.
  */
 
-interface NotifyOptions {
-  /** ntfy topic to publish to. Required. Treat it as a secret. */
+type ChannelName = "ntfy" | "telegram"
+type ChannelSetting = ChannelName | "both" | "auto"
+
+interface NtfyOptions {
+  /** ntfy topic to publish to. Configure this to enable ntfy. Treat it as a secret. */
   topic?: string
   /** ntfy base URL. Defaults to https://ntfy.sh */
   server?: string
   /** Optional ntfy access token for protected topics. Falls back to $NTFY_TOKEN. */
   token?: string
-  /** Optional URL opened when the notification is tapped. */
+}
+
+interface TelegramOptions {
+  /** Telegram bot token from @BotFather. Configure with `chatId` to enable Telegram. Falls back to $TELEGRAM_BOT_TOKEN. */
+  botToken?: string
+  /** Target chat id(s): a value, comma-separated list, or array. Falls back to $TELEGRAM_CHAT_ID. */
+  chatId?: string | number | Array<string | number>
+  /** Send silently (no sound/vibration on the phone). */
+  silent?: boolean
+}
+
+interface NotifyOptions {
+  /** Which channel(s) to use. Defaults to "auto" (every configured channel). */
+  channel?: ChannelSetting
+  /** ntfy settings. Configure `ntfy.topic` to enable ntfy. */
+  ntfy?: NtfyOptions
+  /** Telegram settings. Configure `telegram.botToken` + `telegram.chatId` to enable Telegram. */
+  telegram?: TelegramOptions
+  /** OpenCode web UI URL. Becomes the notification's link (session deep link when known). */
   webUrl?: string
   /** Which triggers are enabled: done, question, permission, error, retry. */
   events?: string[]
-  /** Minimum spacing between pushes, in ms, to avoid burst floods. */
+  /** Minimum spacing between sends, in ms, to avoid burst floods. */
   minIntervalMs?: number
   /** Log every received event to the OpenCode log. Useful for debugging. */
   debug?: boolean
@@ -63,21 +91,69 @@ function tagsFor(kind: string): string[] {
   }
 }
 
+// The web UI routes sessions as /server/<base64url(origin)>/session/<id>, where the
+// server key is the base64url (no padding) encoding of the URL the browser uses.
+function serverKeyFor(webUrl: string): string | null {
+  try {
+    const origin = new URL(webUrl).origin
+    return btoa(origin).replace(/=+$/, "").replace(/\+/g, "-").replace(/\//g, "_")
+  } catch {
+    return null
+  }
+}
+
+function parseChatIds(value: unknown): string[] {
+  if (value === undefined || value === null) return []
+  const raw = Array.isArray(value) ? value : String(value).split(",")
+  return raw
+    .map((item) => String(item).trim())
+    .filter((item) => item.length > 0)
+}
+
 export default {
   id: "notify",
   setup(rawCtx: any) {
     const ctx: any = rawCtx
     const opts: NotifyOptions = ctx.options ?? {}
-    const topic = String(opts.topic ?? process.env.NTFY_TOPIC ?? "")
-    if (!topic) {
-      console.error("[notify] no ntfy topic configured (set options.topic or $NTFY_TOPIC); plugin disabled")
+    const ntfyOpts: NtfyOptions = opts.ntfy ?? {}
+    const telegramOpts: TelegramOptions = opts.telegram ?? {}
+
+    // ---- resolve channels from configuration ---------------------------
+    const topic = String(ntfyOpts.topic ?? process.env.NTFY_TOPIC ?? "")
+    const botToken = String(telegramOpts.botToken ?? process.env.TELEGRAM_BOT_TOKEN ?? "")
+    const chatIds = parseChatIds(telegramOpts.chatId ?? process.env.TELEGRAM_CHAT_ID)
+
+    const ntfyReady = topic.length > 0
+    const telegramReady = botToken.length > 0 && chatIds.length > 0
+
+    const setting: ChannelSetting = (opts.channel ?? "auto") as ChannelSetting
+    const useNtfy = setting === "ntfy" || setting === "both" || (setting === "auto" && ntfyReady)
+    const useTelegram = setting === "telegram" || setting === "both" || (setting === "auto" && telegramReady)
+
+    if (!useNtfy && !useTelegram) {
+      console.error(
+        "[notify] no channel configured; set options.ntfy.topic or options.telegram.botToken + options.telegram.chatId (or $NTFY_TOPIC / $TELEGRAM_BOT_TOKEN + $TELEGRAM_CHAT_ID); plugin disabled",
+      )
       return
     }
+    if (useNtfy && !ntfyReady) {
+      console.error("[notify] ntfy selected but no topic configured (set options.ntfy.topic or $NTFY_TOPIC)")
+    }
+    if (useTelegram && !telegramReady) {
+      console.error(
+        "[notify] telegram selected but bot token / chat id missing (set options.telegram.botToken + options.telegram.chatId or $TELEGRAM_BOT_TOKEN + $TELEGRAM_CHAT_ID)",
+      )
+    }
 
-    const server = String(opts.server ?? process.env.NTFY_SERVER ?? "https://ntfy.sh").replace(/\/+$/, "")
-    const token = opts.token || process.env.NTFY_TOKEN || ""
-    const webUrl = opts.webUrl ?? process.env.NTFY_CLICK
+    const channels: ChannelName[] = []
+    if (useNtfy && ntfyReady) channels.push("ntfy")
+    if (useTelegram && telegramReady) channels.push("telegram")
+
+    const server = String(ntfyOpts.server ?? process.env.NTFY_SERVER ?? "https://ntfy.sh").replace(/\/+$/, "")
+    const ntfyToken = ntfyOpts.token || process.env.NTFY_TOKEN || ""
+    const webUrl = opts.webUrl ?? process.env.NTFY_CLICK ?? process.env.TELEGRAM_WEB_URL
     const minIntervalMs = Math.max(0, Number(opts.minIntervalMs ?? 0) || 0)
+    const silent = telegramOpts.silent === true
     const enabled = new Set<string>(opts.events ?? DEFAULT_EVENTS)
 
     const g = globalThis as any
@@ -119,7 +195,19 @@ export default {
         .catch((e) => console.error("[notify] send failed", e))
     }
 
-    async function send(kind: string, title: string, message: string) {
+    // ---- links -----------------------------------------------------------
+    const baseUrl = webUrl ? String(webUrl).replace(/\/+$/, "") : ""
+    const serverKey = baseUrl ? serverKeyFor(baseUrl) : null
+
+    /** Deep link to the exact session, or the base web UI URL, or undefined. */
+    function sessionUrl(sessionID?: string): string | undefined {
+      if (!baseUrl) return undefined
+      if (!sessionID || !serverKey) return baseUrl
+      return `${baseUrl}/server/${serverKey}/session/${encodeURIComponent(sessionID)}`
+    }
+
+    // ---- per-channel senders --------------------------------------------
+    async function sendNtfy(kind: string, title: string, message: string, sessionID?: string) {
       const payload: Record<string, unknown> = {
         topic,
         title,
@@ -127,18 +215,57 @@ export default {
         priority: priorityFor(kind),
         tags: tagsFor(kind),
       }
-      if (webUrl) payload.click = webUrl
+      const click = sessionUrl(sessionID)
+      if (click) payload.click = click
       const res = await fetch(`${server}/`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          ...(ntfyToken ? { Authorization: `Bearer ${ntfyToken}` } : {}),
         },
         body: JSON.stringify(payload),
       })
       if (!res.ok) {
         console.error(`[notify] ntfy responded ${res.status}: ${await res.text().catch(() => "")}`)
       }
+    }
+
+    async function sendTelegram(kind: string, title: string, message: string, sessionID?: string) {
+      const link = sessionUrl(sessionID)
+      const text = `${title}\n${message}`
+      for (const chatId of chatIds) {
+        const payload: Record<string, unknown> = {
+          chat_id: chatId,
+          text,
+          disable_web_page_preview: true,
+        }
+        if (silent) payload.disable_notification = true
+        if (link) {
+          payload.reply_markup = {
+            inline_keyboard: [[{ text: "Open in OpenCode", url: link }]],
+          }
+        }
+        try {
+          const res = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          })
+          const body = await res.json().catch(() => null)
+          if (!res.ok || body?.ok === false) {
+            console.error(
+              `[notify] Telegram rejected ${kind} for chat ${chatId}: ${res.status} ${body?.description ?? ""}`,
+            )
+          }
+        } catch (e) {
+          console.error(`[notify] Telegram send failed for chat ${chatId}`, e)
+        }
+      }
+    }
+
+    async function send(kind: string, title: string, message: string, sessionID?: string) {
+      if (channels.includes("ntfy")) await sendNtfy(kind, title, message, sessionID)
+      if (channels.includes("telegram")) await sendTelegram(kind, title, message, sessionID)
     }
 
     async function sessionInfo(sessionID: string, location: unknown): Promise<any> {
@@ -186,7 +313,7 @@ export default {
           enqueue(async () => {
             const info = await sessionInfo(sessionID, location)
             if (info?.parentID) return // skip subagent / child sessions
-            await send("done", "✅ Task done", label(info, sessionID, location))
+            await send("done", "✅ Task done", label(info, sessionID, location), sessionID)
           })
         }, 1000),
       )
@@ -221,7 +348,7 @@ export default {
           if (!once(`execfail:${sessionID}:${text}`, 30_000)) return
           const info = sessionID ? await sessionInfo(sessionID, location) : undefined
           enqueue(() =>
-            send("error", "⚠️ Session error", `${label(info, sessionID ?? "unknown", location)}\n${text}`),
+            send("error", "⚠️ Session error", `${label(info, sessionID ?? "unknown", location)}\n${text}`, sessionID),
           )
           return
         }
@@ -245,7 +372,9 @@ export default {
             const head = st.action?.title ?? "Action needed"
             const body = st.action?.message ?? st.message ?? `Retry attempt ${st.attempt}`
             const link = st.action?.link ? `\n${st.action.link}` : ""
-            enqueue(() => send("retry", `⚠️ ${head}`, `${label(info, sessionID, location)}\n${body}${link}`))
+            enqueue(() =>
+              send("retry", `⚠️ ${head}`, `${label(info, sessionID, location)}\n${body}${link}`, sessionID),
+            )
           }
           return
         }
@@ -261,7 +390,9 @@ export default {
             typeof err === "string" ? err : err?.message ?? err?.name ?? JSON.stringify(err ?? "unknown error")
           if (!once(`err:${sessionID}:${text}`, 30_000)) return
           const info = sessionID ? await sessionInfo(sessionID, location) : undefined
-          enqueue(() => send("error", "⚠️ Session error", `${label(info, sessionID ?? "unknown", location)}\n${text}`))
+          enqueue(() =>
+            send("error", "⚠️ Session error", `${label(info, sessionID ?? "unknown", location)}\n${text}`, sessionID),
+          )
           return
         }
 
@@ -276,7 +407,7 @@ export default {
             .join("; ")
           const info = await sessionInfo(form.sessionID, location)
           const body = [label(info, form.sessionID, location), form.title, fields].filter(Boolean).join("\n")
-          enqueue(() => send("question", "❓ Needs your input", body))
+          enqueue(() => send("question", "❓ Needs your input", body, form.sessionID))
           return
         }
 
@@ -288,7 +419,7 @@ export default {
           const action = data.action ?? data.permission ?? "permission"
           const resources = (data.resources ?? data.patterns ?? []).join(", ")
           const body = `${label(info, data.sessionID, location)}\n${action}${resources ? `: ${resources}` : ""}`
-          enqueue(() => send("permission", "🔐 Approval needed", body))
+          enqueue(() => send("permission", "🔐 Approval needed", body, data.sessionID))
           return
         }
 
