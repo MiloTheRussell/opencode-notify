@@ -1,7 +1,7 @@
 {
   "name": "opencode-notify",
   "version": "1.0.0",
-  "description": "OpenCode V2 plugin that pushes ntfy notifications when a run finishes, an agent asks a question, or a tool needs approval.",
+  "description": "OpenCode V2 plugin that pushes ntfy and/or Telegram notifications when a run finishes, an agent asks a question, or a tool needs approval.",
   "type": "module",
   "license": "MIT",
   "main": "./index.ts",
@@ -17,6 +17,7 @@
     "opencode",
     "opencode-plugin",
     "ntfy",
+    "telegram",
     "notifications"
   ]
 }
